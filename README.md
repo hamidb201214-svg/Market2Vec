@@ -94,3 +94,25 @@ Validation reports:
 For forecasting, **Item@K** is the main metric because it directly measures how well the model predicts items in the last product basket.
 
 ---
+## Results — MarketBERT (pretrained Market2Vec checkpoint)
+
+### Training Summary
+- **Model:** `A4_full_fixed_alpha_optionA_h512_h32`
+- **Best validation loss:** `3.6433`
+
+### Validation (HARD)
+- **Acc@1:** `0.5996`
+- **Acc@5:** `0.6651`
+- **Acc@10:** `0.6944`
+
+> “HARD” refers to the stricter evaluation setting used in our validation protocol (forecasting-focused metrics on masked targets).
+
+---
+
+## Usage (Hugging Face)
+
+```python
+from transformers import AutoTokenizer, AutoModel
+
+tok = AutoTokenizer.from_pretrained("HamidBekam/MarketBERT")
+model = AutoModel.from_pretrained("HamidBekam/MarketBERT")
