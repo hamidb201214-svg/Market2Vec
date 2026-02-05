@@ -1,4 +1,5 @@
-# Market2Vec — Trademark-Based Product Timeline Embeddings (Forecasting MLM)
+# Market2Vec
+## Trademark-Based Product Timeline Embeddings (Forecasting MLM)
 
 This repo builds and trains **Market2Vec** from **trademark data** using a **sequence-of-products** view:
 
@@ -6,163 +7,90 @@ This repo builds and trains **Market2Vec** from **trademark data** using a **seq
 - Each **product** is a **sequential event**
 - Each product has an **item set** (goods/services descriptors) treated as a **basket** (set, not order)
 
-Training uses a BERT-style **Masked Language Modeling (MLM)** objective with a **forecasting twist**:
-- **Always mask `ITEM_*` tokens in the last product event** so the model learns to **forecast product items** from the firm’s prior timeline context.
-- Optionally apply standard random MLM masking during training for regularization.
+---
+
+## Two training versions (two objectives)
+
+We support **two versions** of the MLM objective:
+
+### Version A — Forecasting (last-event prediction)
+Purpose: learn to **forecast the last product’s items** from the firm’s earlier product history.
+
+- We identify the **last product event** in the sequence: the segment between the last `[APP]` and the next `[APP_END]` (or `[SEP]`)
+- We **force-mask `ITEM_*` tokens inside that last event** (mask probability = 1.0)
+- (Optional) random masking elsewhere can be turned off for “clean forecasting” evaluation
+
+This version is best when your downstream use-case is “given past trademark products, predict items in the most recent/next product”.
+
+### Version B — Random MLM over the full product sequence
+Purpose: learn general co-occurrence/semantic structure of items in firm timelines (classic MLM).
+
+- We mask tokens **randomly across the whole sequence** with probability `p` (e.g., 15%)
+- This includes items across **all product events**, not only the last one
+- This version behaves like standard BERT MLM, but applied to your product timeline format
+
+This version is best when you want broad embeddings capturing item relationships and temporal context without specifically focusing on forecasting the last event.
 
 ---
 
-## Repository contents
+## How to enable each version in code
 
-- `preprocess.py` (your preprocessing script)
-- `train.py` (your training script using `ForecastingCollator`)
-- `README.md`
+The behavior is controlled by the masking probabilities used in the collator:
 
----
+- `TRAIN_RANDOM_MLM_PROB`
+- `EVAL_RANDOM_MLM_PROB`
 
-## 1) Preprocessing approach
+And by whether you “force-mask last event items” (enabled in the forecasting collator logic).
 
-### Goal
-Convert raw trademark rows into:
-1) **Event-level product records** per firm
-2) **Packed sequences** of events (windows) with `MAX_LEN=512`
-3) A compact vocabulary where head items cover **95% of item occurrences**
+### Recommended settings
 
-### Input
-The preprocessing script reads a Parquet file:
+#### Forecasting-only (Version A)
+- Train: `TRAIN_RANDOM_MLM_PROB = 0.0` (no random MLM noise)
+- Eval:  `EVAL_RANDOM_MLM_PROB  = 0.0`
+- Force-masking last event `ITEM_*` stays **ON**
 
-- `PARQUET_PATH = /.../1996_2025_TM_sequence_with_labelid.parquet`
+This focuses learning and evaluation on last-event item prediction.
 
-Required columns:
+#### Forecasting + regularization (Version A + random noise)
+- Train: `TRAIN_RANDOM_MLM_PROB = 0.15`
+- Eval:  `EVAL_RANDOM_MLM_PROB  = 0.0`
+- Force-masking last event `ITEM_*` stays **ON**
 
-- `owner_id`
-- `ApplicationNumber`
-- `Nice`
-- `RegistrationDate`
-- `Year`
-- `full_description_norm`
+This is the default “forecasting twist” setup: train with extra random MLM, evaluate cleanly on forecasting.
 
-`full_description_norm` is expected to be a semicolon-separated string of item descriptors.
+#### Random MLM across full sequence (Version B)
+- Train: `TRAIN_RANDOM_MLM_PROB = 0.15`
+- Eval:  `EVAL_RANDOM_MLM_PROB  = 0.15` (or any non-zero)
+- (Optional) disable force-masking last-event items if you want *pure* standard MLM
 
----
-
-## 2) Vocabulary design (95% item coverage)
-
-To keep the vocab compact and robust:
-
-✅ **Head vocabulary by coverage**
-- Explode all items (one row per item occurrence)
-- Count item frequencies
-- Keep the most frequent items that cumulatively cover `ITEM_COVERAGE = 0.95` of *all occurrences*
-- All remaining tail items map to **`ITEM_UNK`**
-- Head items are remapped into a compact id space: `ITEM_0 ... ITEM_{H-1}`
-  - `ITEM_0` is the most frequent head item
-
-This makes the model focus capacity on common items while still representing rare items via `ITEM_UNK`.
-
-The saved pickle includes:
-- `id2item_head`: list mapping `new_id -> original item string`
-- `head_old_item_ids`: mapping from `new_id -> old factorized id`
-- `item_coverage`: the coverage threshold used
+> Note: In the current `ForecastingCollator`, force-masking last-event items is always applied.  
+> If you want **pure random MLM** (no forecasting), add a flag like `force_last_event=False` and skip the `prob[force_mask] = 1.0` step.
 
 ---
 
-## 3) Event construction (products as events, baskets as sets)
+## What the forecasting masking means (in practice)
 
-One **event** = one trademark application:
+A packed firm sequence looks like:
 
-- Group by `(owner_id, ApplicationNumber)`
-- Event timestamp:
-  - use `RegistrationDate` if available
-  - else fallback to `Year-01-01`
+[CLS]
+DATE_YYYY_MM [APP] NICE_* ... ITEM_* ... [APP_END]
+DATE_YYYY_MM [APP] NICE_* ... ITEM_* ... [APP_END]
+...
+DATE_YYYY_MM [APP] NICE_* ... ITEM_* ... [APP_END] <-- last event
+[SEP]
 
-Within each event:
-- NICE classes are treated as a **set**:
-  - dedupe + sort + cap (`MAX_NICE_PER_APP`)
-- Items are treated as a **set**:
-  - map to compact head ids or UNK (`-1`)
-  - dedupe + canonical ordering + cap (`MAX_ITEMS_PER_APP`)
-  - `ITEM_UNK` appears at most once and is kept even when capped
 
-So each event becomes a clean basket:
-DATE_YYYY_MM [APP] NICE_... ITEM_... [APP_END]
+- **Version A:** masks `ITEM_*` in the last `[APP]..[APP_END]` segment (forecasting target)
+- **Version B:** masks tokens randomly across the entire sequence (classic MLM)
 
 ---
 
-## 4) Tokenization schema
+## Metrics
 
-The preprocessing writes a custom `vocab.txt` and builds a `BertTokenizer` from it.
+Validation reports:
+- **AccAll**: accuracy over all masked tokens
+- **Item@K**: Top-K accuracy restricted to masked positions where the true label is an `ITEM_*` token
 
-Vocabulary includes:
-
-**Special/event markers**
-- `[PAD] [UNK] [CLS] [SEP] [MASK] [APP] [APP_END]`
-
-**Time**
-- `DATE_YYYY_MM` for every month in the dataset date range (month-start aligned)
-
-**NICE**
-- `NICE_01 ... NICE_45`
-- `NICE_UNK`
-
-**Items**
-- `ITEM_UNK`
-- `ITEM_0 ... ITEM_{H-1}` (head items only)
+For forecasting, **Item@K** is the main metric because it directly measures how well the model predicts items in the last product basket.
 
 ---
-
-## 5) Sequence building (MAX_LEN=512, never cut inside an event)
-
-The preprocessing builds **event-packed windows** per firm:
-
-- Final sequence length `<= 512` including `[CLS]` and `[SEP]`
-- Uses `MAX_TL = 510` for payload tokens
-- **Never cuts inside an event**: it packs full events until the next event would exceed length.
-- Generates multiple windows by using event-level start offsets:
-  - `START_EVENT_OFFSETS = (0, 1, 2)`
-- Windows shorter than `MIN_SEQ_TOKENS` are discarded.
-
-Each output sequence is:
-
-[CLS] (DATE + [APP] + NICE-set + ITEM-set + [APP_END]) * K [SEP]
-
----
-
-## 6) Train/valid/test splitting (month-based by last event)
-
-Each packed window is assigned to a split based on the **month of its last event**:
-
-- Train: `last_ym <= TRAIN_CUTOFF_YM` (default `202312`)
-- Valid: `VALID_START_YM..VALID_END_YM` (default `202401..202412`)
-- Test:  `last_ym >= TEST_START_YM` (default `202501+`)
-
-This preserves temporal ordering and avoids leaking future products into training.
-
----
-
-## 7) Set-of-items behavior (optional shuffle in TRAIN)
-
-Within an event, NICE and Items are **sets**. To avoid accidental learning of token order, TRAIN windows can apply **deterministic shuffling**:
-
-- `TRAIN_SHUFFLE_ITEMS = True` (default)
-- `TRAIN_SHUFFLE_NICE = False` (default)
-- Shuffling is deterministic per window using a stable hash seed (`stable_seed(...)`)
-
-This keeps the “basket” assumption while still producing varied token order during training.
-
----
-
-## 8) Preprocessing output
-
-The script writes:
-
-`OUTPUT_DIR/processed_data.pkl`
-
-with keys:
-
-- `train`, `valid`, `test`: lists of sequences (list[int])
-- `vocab_file`: path to generated vocab.txt
-- `id2item_head`, `head_old_item_ids`
-- `item_coverage`
-- `max_len`
-
